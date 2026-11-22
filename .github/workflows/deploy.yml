@@ -1,0 +1,72 @@
+name: Deploy Site
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+# main -> wranglebot.com (production); any other branch -> <branch>.wranglebot.pages.dev (preview).
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy (Cloudflare Pages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HAS_CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure Pages project exists
+        if: env.HAS_CF_TOKEN == 'true'
+        run: |
+          npx wrangler pages project list | grep -q "wranglebot" \
+            || npx wrangler pages project create wranglebot --production-branch=main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 554619f8c7d3a4010cb161df3037269d
+
+      - name: Deploy to Cloudflare Pages
+        if: env.HAS_CF_TOKEN == 'true'
+        id: deploy
+        run: |
+          npx wrangler pages deploy . --project-name=wranglebot --branch="${{ github.ref_name }}" 2>&1 | tee /tmp/deploy.log
+          # CF truncates long branch aliases (e.g. feat-readme-brand-and-site-h) —
+          # never reconstruct the alias from the branch name; take it from wrangler.
+          alias_url=$(grep -oE 'Deployment alias URL: https://[^[:space:]]+' /tmp/deploy.log | awk '{print $NF}')
+          echo "alias_url=${alias_url:-none}" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 554619f8c7d3a4010cb161df3037269d
+
+      - name: Smoke-check the deployment
+        if: env.HAS_CF_TOKEN == 'true'
+        run: |
+          sleep 20
+          branch="${{ github.ref_name }}"
+          if [ "$branch" = "main" ]; then
+            base="https://wranglebot.com"
+          else
+            base="${{ steps.deploy.outputs.alias_url }}"
+            if [ -z "$base" ] || [ "$base" = "none" ]; then
+              echo "::warning::No alias URL captured from wrangler output — skipping preview smoke"
+              exit 0
+            fi
+          fi
+          echo "smoke base: ${base}"
+          for path in / /docs.html /changelog.html /license.html; do
+            code=$(curl -sL -o /dev/null -w '%{http_code}' "${base}${path}")
+            echo "${path} -> ${code}"
+            case "$code" in
+              200|403) ;; # 403 = CF bot-challenges runner IPs; site is up
+              *) echo "FAIL: ${path} -> ${code}"; exit 1 ;;
+            esac
+          done
+
+      - name: No token yet — skip deploy
+        if: env.HAS_CF_TOKEN != 'true'
+        run: |
+          echo "::warning::CLOUDFLARE_API_TOKEN secret is not set — deploy skipped. Add the secret (Cloudflare token with Pages: Edit) and re-run this workflow."
